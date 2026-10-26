@@ -823,27 +823,47 @@ fn reject_locked_launch_arguments(arguments: &Value) -> Result<(), ProtocolError
 }
 
 /// With `mcp --lock-launch`, batch may not run connect or carry launch-locked flags in its inner commands.
+/// Positional extraArgs count as inner commands too: the CLI runs `batch <command>...` arguments instead of stdin.
 fn reject_locked_batch_commands(arguments: &Value) -> Result<(), ProtocolError> {
-    let Some(commands) = arguments.get("commands").and_then(Value::as_array) else {
-        return Ok(());
-    };
-    for (i, command) in commands.iter().enumerate() {
-        let words: Vec<&str> = command
-            .as_array()
-            .map(|items| items.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        if words.first() == Some(&"connect") {
+    let mut commands: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(typed) = arguments.get("commands").and_then(Value::as_array) {
+        for (i, command) in typed.iter().enumerate() {
+            let words = command
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            commands.push((format!("commands[{}]", i), words));
+        }
+    }
+    for (i, token) in optional_string_array(arguments, "extraArgs")?
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        commands.push((
+            format!("extraArgs[{}]", i),
+            crate::commands::shell_words_split(token),
+        ));
+    }
+    for (label, words) in commands {
+        if words.first().map(String::as_str) == Some("connect") {
             return Err(ProtocolError::invalid_params(format!(
-                "commands[{}] may not run connect while agent-browser mcp runs with --lock-launch",
-                i
+                "{} may not run connect while agent-browser mcp runs with --lock-launch",
+                label
             )));
         }
-        for word in words {
+        for word in &words {
             let name = word.split('=').next().unwrap_or(word);
             if LAUNCH_LOCKED_GLOBALS.contains(&name) {
                 return Err(ProtocolError::invalid_params(format!(
-                    "commands[{}] may not set {} while agent-browser mcp runs with --lock-launch",
-                    i, name
+                    "{} may not set {} while agent-browser mcp runs with --lock-launch",
+                    label, name
                 )));
             }
         }
@@ -4983,6 +5003,48 @@ mod tests {
         }
         reject_locked_batch_commands(&json!({
             "commands": [["open", "https://example.com"], ["snapshot", "-i"], ["get", "title"]]
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn lock_launch_rejects_connect_in_batch_extra_args() {
+        // Positional batch arguments replace the stdin commands, so extraArgs can carry a whole command.
+        let arguments = json!({ "commands": [["get", "title"]], "extraArgs": ["connect 9222"] });
+        let args = cli_tool_args(&arguments, vec!["batch".to_string()], None).unwrap();
+        let clean = crate::flags::clean_args(&args);
+        let parsed =
+            crate::commands::parse_command(&clean, &crate::flags::parse_flags(&args)).unwrap();
+        assert_eq!(parsed["action"], "batch");
+        assert_eq!(parsed["commands"], json!(["connect 9222"]));
+
+        let locked = McpConfig {
+            lock_launch: true,
+            ..McpConfig::all()
+        };
+        for extra in [
+            vec!["connect 9222"],
+            vec!["--bail", "  connect ws://127.0.0.1:9222"],
+        ] {
+            let err = call_tool(
+                Some(&json!({
+                    "name": TOOL_BATCH,
+                    "arguments": { "commands": [["get", "title"]], "extraArgs": extra }
+                })),
+                &locked,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32602);
+            assert!(
+                err.message.contains("may not run connect"),
+                "{}",
+                err.message
+            );
+            assert!(err.message.starts_with("extraArgs["), "{}", err.message);
+        }
+        reject_locked_batch_commands(&json!({
+            "commands": [["get", "title"]],
+            "extraArgs": ["--bail", "get url"]
         }))
         .unwrap();
     }
